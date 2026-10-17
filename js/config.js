@@ -14,7 +14,7 @@ export const firebaseConfig = {
 // Cloudinary (plan gratis). Crea un "Upload preset" de tipo UNSIGNED.
 // Cloudinary → Settings → Upload → Upload presets
 export const cloudinary = {
-  cloudName: "TU_CLOUD_NAME",
+  cloudName: "dy66brku6",
   uploadPreset: "kiosko_unsigned"
 };
 
