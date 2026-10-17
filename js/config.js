@@ -3,12 +3,12 @@
 //  (Firebase Console → Configuración del proyecto → Tus apps → Web)
 // ============================================================
 export const firebaseConfig = {
-  apiKey: "PEGA_AQUI_TU_API_KEY",
-  authDomain: "TU-PROYECTO.firebaseapp.com",
-  projectId: "TU-PROYECTO",
-  storageBucket: "TU-PROYECTO.appspot.com",
-  messagingSenderId: "000000000000",
-  appId: "1:000000000000:web:0000000000000000"
+  apiKey: "AIzaSyD1YGg4UvCC3jmISP4GQ4Eg_LktT5deymY",
+  authDomain: "kiosko-colombia.firebaseapp.com",
+  projectId: "kiosko-colombia",
+  storageBucket: "kiosko-colombia.firebasestorage.app",
+  messagingSenderId: "697489490073",
+  appId: "1:697489490073:web:e816144ac8e7f2b2123808"
 };
 
 // Cloudinary (plan gratis). Crea un "Upload preset" de tipo UNSIGNED.
