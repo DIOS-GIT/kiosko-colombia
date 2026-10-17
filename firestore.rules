@@ -1,0 +1,240 @@
+rules_version = '2';
+// ============================================================
+//  KIOSKO COLOMBIA — Reglas de seguridad de Firestore (v1)
+//  Plan gratis (Spark): toda la protección vive aquí.
+//  Roles: admin, gerente, mesero, cocina, cajero, domiciliario, inventario
+//  + empleados temporales (cuenta anónima autorizada con un código).
+// ============================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------- Funciones de apoyo ----------------
+    function signedIn() { return request.auth != null; }
+    function isAnon()   { return signedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous'; }
+
+    function perfil()      { return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data; }
+    function tienePerfil() { return signedIn() && !isAnon() && exists(/databases/$(database)/documents/usuarios/$(request.auth.uid)); }
+    function esFijo()      { return tienePerfil() && perfil().activo == true; }
+    function rolFijo()     { return perfil().rol; }
+
+    // --- Acceso temporal ---
+    function accesoTmp()   { return get(/databases/$(database)/documents/accesos/$(request.auth.uid)).data; }
+    function sesionTmp()   { return get(/databases/$(database)/documents/sesiones_temporales/$(accesoTmp().sesionId)).data; }
+    function turnoDe(id)   { return get(/databases/$(database)/documents/turnos/$(id)).data; }
+    function esTemporal()  {
+      return isAnon()
+        && exists(/databases/$(database)/documents/accesos/$(request.auth.uid))
+        && sesionTmp().estado == 'activa'
+        && sesionTmp().usadoPor == request.auth.uid
+        && sesionTmp().expiraEn > request.time
+        && turnoDe(sesionTmp().turnoId).estado == 'abierto';
+    }
+
+    function rolActual()   { return esFijo() ? rolFijo() : (esTemporal() ? sesionTmp().rol : ''); }
+    function esStaff()     { return rolActual() != ''; }
+    function esAdmin()     { return esFijo() && rolFijo() == 'admin'; }
+    function esGerente()   { return esFijo() && rolFijo() in ['admin', 'gerente']; }
+    function esRol(lista)  { return rolActual() in lista; }
+    function nombreActor() { return esFijo() ? perfil().nombre : sesionTmp().nombre; }
+
+    function afectaSolo(campos) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(campos); }
+    function turnoAbierto() {
+      return get(/databases/$(database)/documents/config/estado).data.abierto == true
+          && get(/databases/$(database)/documents/config/estado).data.turnoId == request.resource.data.turnoId;
+    }
+
+    // ---------------- Configuración pública ----------------
+    match /config/sitio {
+      allow read: if true;
+      allow write: if esAdmin();
+    }
+    match /config/estado {
+      allow read: if true;
+      allow create: if esGerente();
+      // Abrir/cerrar caja: solo admin, gerente o cajero (ver turnos)
+      allow update: if esFijo() && rolFijo() in ['admin', 'gerente', 'cajero'];
+    }
+
+    // ---------------- Usuarios del personal ----------------
+    match /usuarios/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || esGerente());
+      // Primer admin: el propio usuario puede crear SU perfil como admin solo si aún no hay sitio configurado
+      allow create: if esAdmin()
+        || (request.auth.uid == uid && !isAnon()
+            && request.resource.data.rol == 'admin'
+            && request.resource.data.activo == true
+            && !exists(/databases/$(database)/documents/config/sitio));
+      allow update: if esAdmin()
+        && !(uid == request.auth.uid && (request.resource.data.rol != 'admin' || request.resource.data.activo != true));
+      allow delete: if false; // se desactivan, no se borran
+    }
+
+    // ---------------- Carta ----------------
+    match /categorias/{id} {
+      allow read: if true;
+      allow write: if esAdmin();
+    }
+    match /productos/{id} {
+      allow read: if true;
+      allow create, delete: if esAdmin();
+      // El gerente (y cocina) pueden marcar agotado sin tocar nada más
+      allow update: if esAdmin()
+        || (esRol(['gerente', 'cocina']) && afectaSolo(['agotado']));
+    }
+
+    // ---------------- Mesas ----------------
+    match /mesas/{id} {
+      allow read: if true; // el cliente necesita validar el QR de su mesa
+      allow write: if esAdmin();
+    }
+
+    // ---------------- Turnos / caja ----------------
+    match /turnos/{id} {
+      allow read: if esStaff();
+      allow create: if esFijo() && rolFijo() in ['admin', 'gerente', 'cajero']
+        && request.resource.data.estado == 'abierto'
+        && request.resource.data.abiertoPor == request.auth.uid;
+      allow update: if esFijo() && rolFijo() in ['admin', 'gerente', 'cajero']
+        && resource.data.estado == 'abierto'
+        && request.resource.data.estado == 'cerrado'
+        && request.resource.data.cerradoPor == request.auth.uid;
+      allow delete: if false;
+    }
+
+    // ---------------- Empleados temporales ----------------
+    match /sesiones_temporales/{id} {
+      // Se lee por ID largo e impredecible (el código). Listar está prohibido.
+      allow get: if signedIn();
+      allow list: if esGerente();
+      allow create: if esGerente()
+        && request.resource.data.estado == 'pendiente'
+        && request.resource.data.rol in ['mesero', 'cocina', 'cajero', 'domiciliario']
+        && request.resource.data.creadoPor == request.auth.uid
+        && request.resource.data.keys().hasAll(['nombre', 'rol', 'turnoId', 'expiraEn', 'canjeableHasta'])
+        && request.resource.data.turnoId == get(/databases/$(database)/documents/config/estado).data.turnoId
+        && get(/databases/$(database)/documents/config/estado).data.abierto == true
+        && request.resource.data.expiraEn > request.time
+        && request.resource.data.expiraEn <= request.time + duration.value(1, 'd')
+        && request.resource.data.canjeableHasta <= request.time + duration.value(1, 'd');
+      // Canjear (una sola vez, por la cuenta anónima que lo usa)
+      allow update: if (isAnon()
+            && resource.data.estado == 'pendiente'
+            && resource.data.expiraEn > request.time
+            && resource.data.canjeableHasta > request.time
+            && turnoDe(resource.data.turnoId).estado == 'abierto'
+            && request.resource.data.estado == 'activa'
+            && request.resource.data.usadoPor == request.auth.uid
+            && afectaSolo(['estado', 'usadoPor', 'usadoEn']))
+        // Revocar
+        || (esGerente() && request.resource.data.estado == 'revocada' && afectaSolo(['estado', 'revocadoPor']));
+      allow delete: if false;
+    }
+    match /accesos/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create: if isAnon() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['sesionId', 'creadoEn'])
+        && getAfter(/databases/$(database)/documents/sesiones_temporales/$(request.resource.data.sesionId)).data.usadoPor == request.auth.uid
+        && getAfter(/databases/$(database)/documents/sesiones_temporales/$(request.resource.data.sesionId)).data.estado == 'activa';
+      allow update, delete: if false;
+    }
+
+    // ---------------- Pedidos ----------------
+    match /pedidos/{id} {
+      function crearValido() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['codigo', 'origen', 'mesaId', 'mesaNumero', 'uidCliente', 'cliente', 'items', 'subtotal', 'envio', 'total',
+                                 'estado', 'turnoId', 'creadoEn', 'metodoPago', 'nota', 'canal'])
+          && d.estado == 'pendiente_confirmacion'
+          && d.uidCliente == request.auth.uid
+          && d.origen in ['mesa', 'recoger', 'domicilio']
+          && d.creadoEn == request.time
+          && d.items is list && d.items.size() > 0 && d.items.size() <= 40
+          && d.codigo is string && d.codigo.size() >= 5 && d.codigo.size() <= 8
+          && d.cliente is map
+          && (!('nota' in d) || (d.nota is string && d.nota.size() <= 300))
+          && d.total is number && d.total >= 0 && d.total < 20000000
+          && turnoAbierto();
+      }
+      // Lectura: personal, o el propio cliente. Un cliente solo puede obtener (get) su pedido,
+      // no listar los de otros. El id es aleatorio y largo.
+      allow get: if signedIn() && (resource.data.uidCliente == request.auth.uid || esStaff());
+      allow list: if esStaff() || (signedIn() && resource.data.uidCliente == request.auth.uid);
+
+      // Crear: cualquier visitante (anónimo o con cuenta), siempre como "pendiente_confirmacion"
+      allow create: if signedIn() && crearValido()
+        && get(/databases/$(database)/documents/config/estado).data.get('pedidosEnLinea', true) == true;
+
+      // Cliente: solo puede cancelar su pedido mientras no lo confirmen
+      allow update: if
+        (signedIn() && resource.data.uidCliente == request.auth.uid
+          && resource.data.estado == 'pendiente_confirmacion'
+          && request.resource.data.estado == 'cancelado'
+          && afectaSolo(['estado']))
+        // Confirmar / rechazar: mesero, cajero, gerente, admin
+        || (esRol(['admin', 'gerente', 'mesero', 'cajero'])
+          && resource.data.estado == 'pendiente_confirmacion'
+          && ((request.resource.data.estado == 'confirmado'
+                && request.resource.data.confirmadoPor == request.auth.uid
+                && request.resource.data.confirmadoNombre == nombreActor()
+                && request.resource.data.confirmadoEn == request.time
+                && afectaSolo(['estado', 'items', 'subtotal', 'envio', 'total', 'confirmadoPor', 'confirmadoNombre', 'confirmadoEn']))
+            || (request.resource.data.estado == 'rechazado'
+                && request.resource.data.rechazadoPor == request.auth.uid
+                && request.resource.data.motivoRechazo is string
+                && request.resource.data.motivoRechazo.size() >= 3
+                && afectaSolo(['estado', 'rechazadoPor', 'rechazadoNombre', 'rechazadoEn', 'motivoRechazo']))))
+        // Cocina: confirmado → preparando → listo
+        || (esRol(['admin', 'gerente', 'cocina'])
+          && ((resource.data.estado == 'confirmado' && request.resource.data.estado == 'preparando'
+                && request.resource.data.preparadoPor == request.auth.uid
+                && afectaSolo(['estado', 'preparadoPor', 'preparadoNombre', 'preparandoEn']))
+            || (resource.data.estado == 'preparando' && request.resource.data.estado == 'listo'
+                && afectaSolo(['estado', 'listoPor', 'listoNombre', 'listoEn']))))
+        // Entrega: listo → entregado (mesero, domiciliario, gerente, admin)
+        || (esRol(['admin', 'gerente', 'mesero', 'domiciliario'])
+          && resource.data.estado == 'listo' && request.resource.data.estado == 'entregado'
+          && request.resource.data.entregadoPor == request.auth.uid
+          && afectaSolo(['estado', 'entregadoPor', 'entregadoNombre', 'entregadoEn']))
+        // Cobro: entregado (o listo) → cobrado (cajero, gerente, admin, mesero)
+        || (esRol(['admin', 'gerente', 'cajero', 'mesero'])
+          && resource.data.estado in ['listo', 'entregado'] && request.resource.data.estado == 'cobrado'
+          && request.resource.data.cobradoPor == request.auth.uid
+          && request.resource.data.metodoPago in ['efectivo', 'electronico', 'contraentrega']
+          && afectaSolo(['estado', 'cobradoPor', 'cobradoNombre', 'cobradoEn', 'metodoPago']))
+        // Anular: solo gerente o admin, con motivo (queda en auditoría)
+        || (esGerente()
+          && request.resource.data.estado == 'anulado'
+          && request.resource.data.anuladoPor == request.auth.uid
+          && request.resource.data.motivoAnulacion is string && request.resource.data.motivoAnulacion.size() >= 3
+          && afectaSolo(['estado', 'anuladoPor', 'anuladoNombre', 'anuladoEn', 'motivoAnulacion']));
+      allow delete: if false;
+    }
+
+    // ---------------- Inventario ----------------
+    match /inventario/{id} {
+      allow read: if esStaff() && esRol(['admin', 'gerente', 'inventario']);
+      allow create, delete: if esAdmin();
+      allow update: if esRol(['admin', 'gerente', 'inventario']);
+    }
+
+    // ---------------- Gastos ----------------
+    match /gastos/{id} {
+      allow read: if esFijo() && rolFijo() in ['admin', 'gerente', 'inventario'];
+      allow create: if esFijo() && rolFijo() in ['admin', 'gerente', 'inventario']
+        && request.resource.data.registradoPor == request.auth.uid
+        && request.resource.data.monto is number && request.resource.data.monto > 0;
+      allow update, delete: if esAdmin();
+    }
+
+    // ---------------- Auditoría (solo se agrega) ----------------
+    match /auditoria/{id} {
+      allow read: if esGerente();
+      allow create: if esStaff() && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.fecha == request.time;
+      allow update, delete: if false;
+    }
+
+    // Todo lo demás está cerrado
+    match /{document=**} { allow read, write: if false; }
+  }
+}
